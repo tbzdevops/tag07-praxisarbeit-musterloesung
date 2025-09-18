@@ -1,0 +1,179 @@
+name: CD Deploy to EC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh-host:
+        description: EC2 public DNS or IP
+        required: true
+      ssh-port:
+        description: SSH port
+        required: false
+        default: '22'
+      ssh-user:
+        description: SSH username (ubuntu|ec2-user)
+        required: true
+        default: ubuntu
+      aws-region:
+        description: AWS region (only needed if ssh-host is an EC2 instance-id)
+        required: false
+        default: us-east-1
+      service-user:
+        description: Systemd user on EC2 (ubuntu|ec2-user|flaskapp)
+        required: true
+        default: ubuntu
+      venv-dir:
+        description: Venv path on EC2
+        required: true
+        default: /opt/flaskapp/venv
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+  
+      - name: Build (sdist + wheel)
+        working-directory: src
+        run: python -m build
+
+      - name: Upload dist as artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-dist
+          path: src/dist/*
+
+  deploy:
+    needs: publish
+    if: ${{ needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download published wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: published-dist
+          path: dist
+
+      - name: Locate wheel file
+        id: wheel
+        shell: bash
+        run: |
+          set -e
+          WHEEL=$(ls dist/*.whl | head -n1)
+          if [ -z "$WHEEL" ]; then echo "No wheel found in dist/"; ls -la dist || true; exit 1; fi
+          echo "wheel=$WHEEL" >> $GITHUB_OUTPUT
+          echo "wheel_name=$(basename "$WHEEL")" >> $GITHUB_OUTPUT
+
+      - name: Init effective SSH host
+        shell: bash
+        run: |
+          echo "SSH_HOST_EFFECTIVE=${{ inputs.ssh-host }}" >> $GITHUB_ENV
+
+      - name: Configure AWS (for instance-id host)
+        if: startsWith(inputs.ssh-host, 'i-')
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Resolve EC2 instance host
+        if: startsWith(inputs.ssh-host, 'i-')
+        shell: bash
+        run: |
+          set -e
+          ID="${{ inputs.ssh-host }}"
+          DNS=$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].PublicDnsName' --output text)
+          if [ -z "$DNS" ] || [ "$DNS" = "None" ]; then
+            IP=$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+            if [ -z "$IP" ] || [ "$IP" = "None" ]; then
+              echo "Could not resolve a public DNS/IP for instance $ID. Ensure it has a public address or use a bastion." >&2
+              exit 1
+            fi
+            echo "Resolved instance $ID to IP $IP"
+            echo "SSH_HOST_EFFECTIVE=$IP" >> $GITHUB_ENV
+          else
+            echo "Resolved instance $ID to DNS $DNS"
+            echo "SSH_HOST_EFFECTIVE=$DNS" >> $GITHUB_ENV
+          fi
+
+      - name: Add host key
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${{ inputs.ssh-port }}" -H "${{ env.SSH_HOST_EFFECTIVE }}" >> ~/.ssh/known_hosts
+
+      - name: Copy wheel to EC2 (SCP)
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ env.SSH_HOST_EFFECTIVE }}
+          username: ${{ inputs.ssh-user }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ inputs.ssh-port }}
+          source: "dist/${{ steps.wheel.outputs.wheel_name }}"
+          target: "/tmp/"
+          strip_components: 1
+          overwrite: true
+
+      - name: Copy requirements.txt to EC2 (optional)
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ env.SSH_HOST_EFFECTIVE }}
+          username: ${{ inputs.ssh-user }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ inputs.ssh-port }}
+          source: "src/requirements.txt"
+          target: "/tmp/"
+          strip_components: 1
+          overwrite: true
+
+      - name: Install and restart service (SSH)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.SSH_HOST_EFFECTIVE }}
+          username: ${{ inputs.ssh-user }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ inputs.ssh-port }}
+          debug: true
+          script: |
+            set -euo pipefail
+            set -x
+            sudo mkdir -p /opt/flaskapp && sudo chown -R ${{ inputs.service-user }}:${{ inputs.service-user }} /opt/flaskapp
+            # Ensure venv capability present on Debian/Ubuntu
+            if ! python3 -m venv --help >/dev/null 2>&1; then
+              if command -v apt-get >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y python3-venv python3-pip; fi
+            fi
+            if [ ! -d "${{ inputs.venv-dir }}" ]; then python3 -m venv "${{ inputs.venv-dir }}"; fi
+            source "${{ inputs.venv-dir }}/bin/activate"
+            python -V
+            pip -V
+            pip install --upgrade pip
+            if [ -f "/tmp/requirements.txt" ]; then pip install -r /tmp/requirements.txt; fi
+            ls -l "/tmp/${{ steps.wheel.outputs.wheel_name }}"
+            pip install --no-cache-dir --force-reinstall "/tmp/${{ steps.wheel.outputs.wheel_name }}"
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now flaskapp
+            sudo systemctl restart flaskapp
+            sleep 2
+            if ! sudo systemctl is-active --quiet flaskapp; then
+              sudo systemctl status --no-pager --full flaskapp || true
+              sudo journalctl -u flaskapp -n 100 --no-pager || true
+              exit 1
+            fi

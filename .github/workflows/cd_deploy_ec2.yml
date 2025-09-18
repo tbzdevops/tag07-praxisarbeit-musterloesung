@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ssh-host:
-        description: EC2 public DNS or IP
+        description: EC2 Instance ID, public DNS or IP
         required: true
       ssh-port:
         description: SSH port
